@@ -11,6 +11,7 @@ In order to reproduce the analysis of this paper, data from the following source
 		- "VNL_v2_npp_2016_global_vcmslcfg_c202101211500.average.tif"
 		- "VNL_v2_npp_2017_global_vcmslcfg_c202101211500.average.tif"
 	- (download [here](https://eogdata.mines.edu/products/vnl/))
+	- The tif files should be saved in the pre-made folders. For instance "VNL_v2_npp_2017_global_vcmslcfg_c202101211500.average.tif" should be saved in "06-2017".
 
 2. Administrative Boundaries (~300MB)
 	- For each country, a shapefile with necessary administrative boundaries is necessary to run the analysis. Keep in mind that each shapefile is comprised of five files with the appendices cpg, dbf, prj, shp, shx. The following files are to be downloaded with all appendices.
@@ -27,6 +28,7 @@ In order to reproduce the analysis of this paper, data from the following source
 		- Kenya: gadm36_KEN_2
 		- Ethiopia: gadm36_ETH_2
 	- (download [here](https://gadm.org/download_country_v3.html))
+	- The shapefiles should all simply be dropped in the folder "Shapefiles"
 
 
 3. DHS geolocated survey data (~3GB)
@@ -44,3 +46,5 @@ In order to reproduce the analysis of this paper, data from the following source
 		- Kenya: 2014
 		- Ethiopia: 2016
 	- (download [here](https://dhsprogram.com/data/available-datasets.cfm))
+	- The data should be safed in the pre-made folders. 
+	- Example: When downloading DHS data for Mali, the download will contain multiple subfolders including "MLGE7AFL". This folder contains the geo-information and should be safed in the folder "2018" which is saved in the folder "Mali".
