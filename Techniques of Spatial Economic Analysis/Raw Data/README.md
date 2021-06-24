@@ -48,3 +48,12 @@ In order to reproduce the analysis of this paper, data from the following source
 	- (download [here](https://dhsprogram.com/data/available-datasets.cfm))
 	- The data should be safed in the pre-made folders. 
 	- Example: When downloading DHS data for Mali, the download will contain multiple subfolders including "MLGE7AFL". This folder contains the geo-information and should be safed in the folder "2018" which is saved in the folder "Mali".
+
+
+4. GHS Population Data (~2GB)
+	- To allow for weighing luminosity values, the GHS population dataset serves well. I recommend downloading the following:
+		- Product: GHS-POP
+		- Epoch: 2015
+		- Resolution: 9 arcsec
+		- Coordinate system: WGS84
+	- The file "GHS_POP_E2015_GLOBE_R2019A_4326_9ss_V1_0.tif" should be dropped in the folder "Population"
