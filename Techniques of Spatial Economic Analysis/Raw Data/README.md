@@ -57,3 +57,4 @@ In order to reproduce the analysis of this paper, data from the following source
 		- Resolution: 9 arcsec
 		- Coordinate system: WGS84
 	- The file "GHS_POP_E2015_GLOBE_R2019A_4326_9ss_V1_0.tif" should be dropped in the folder "Population"
+	- (download [here](https://ghsl.jrc.ec.europa.eu/download.php?ds=pop))
