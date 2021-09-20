@@ -7,4 +7,4 @@ This is a repository including selected pieces of my coursework from the MSc in 
 - [Techniques of Spatial Economic Analysis](https://www.lse.ac.uk/resources/calendar2020-2021/courseGuides/GY/2020_GY460.htm)
 - [Applied Machine Learning for Social Science](https://www.lse.ac.uk/resources/calendar2020-2021/courseGuides/MY/2020_MY474.htm)
 
-Feel free to contact me with any questions at [j.s.karl@lse.ac.uk](j.s.karl@lse.ac.uk)
+Feel free to contact me with any questions at [jonathan.karl2501@gmail.com](jonathan.karl2501@gmail.com)
