@@ -10,4 +10,4 @@ In order to enable a smooth run of the files the folder "assignment-final-data" 
 
 Running the code is best done within the file "MY470_final_assign.ipynb" (a Juypter Notebook) which both explains the objective of this task and displays results.
 
-If any questions should come up, please feel free to email me at j.s.karl@lse.ac.uk
+If any questions should come up, please feel free to email me at jonathan.karl2501@gmail.com
