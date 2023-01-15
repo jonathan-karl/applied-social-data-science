@@ -1,5 +1,3 @@
-# applied-social-data-science
-
 In order to reproduce the analysis of this paper, data from the following sources is necessary to download.
 
 1. Nightlight Luminosity Data (~90GB)
