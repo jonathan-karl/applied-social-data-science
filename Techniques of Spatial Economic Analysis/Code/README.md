@@ -1,4 +1,4 @@
-# applied-social-data-science
+# Techniques of Spatial Economic Analysis
 
 These coding files should be run after all data has been downloaded (see Raw Data README-file) in the following sequence. 
 
