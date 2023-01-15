@@ -1,5 +1,3 @@
-### Coding Example - Jonathan Karl 
-
 ### This is extracted from the final assignment of the course MY470 Computer Programming, taught by Milena Tsvetkova
 
 ---
