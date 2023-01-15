@@ -1,0 +1,839 @@
+---
+title: "Classification Challenge Code"
+author: "Jonathan Karl"
+date: |
+  | `r format(Sys.time(), '%d %B %Y')`
+output: pdf_document
+---
+
+# Libraries
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Load libraries
+library("quanteda")
+library("quanteda.textmodels")
+library("quanteda.classifiers")
+library("quanteda.dictionaries")
+library("quanteda.textstats")
+library("caret")
+library("tidyverse")
+library("devtools")
+library("tensorflow")
+library("keras")
+library("stats")
+library("e1071")
+library("doMC")
+library("glmnet")
+library("rvest")
+library("hunspell")
+```
+
+# Functions
+
+```{r}
+
+###################### Compute Metrics
+compute_precision <- function(confusion_mtrx){
+  precision <- confusion_mtrx[2,2]/(confusion_mtrx[2,2] + confusion_mtrx[2,1])
+  return(precision)
+}
+
+compute_recall <- function(confusion_mtrx){
+  recall <- confusion_mtrx[2,2]/(confusion_mtrx[2,2] + confusion_mtrx[1,2])
+  return(recall)
+}
+
+compute_f1 <- function(precision, recall){
+  (2*precision*recall)/(precision + recall)
+}
+
+
+###################### For Neural Networks Manual
+# Find optimal threshold
+find_optimal_threshold <- function(threshold){
+  y_train <- predict(model, train.2$text, verbose = 2)
+  y_train_vec <- ifelse(y_train >= threshold, 1, 0) %>% as.vector()
+  confusion_mtrx <- table(y_train_vec, train.2$attack)
+  
+  if(length(confusion_mtrx) == 2){
+    print("Only 1 predicted class at threshold:", threshold)
+    return(0)
+  }
+  else{
+    precision <- confusion_mtrx[2,2]/(confusion_mtrx[2,2] + confusion_mtrx[2,1])
+    recall <- confusion_mtrx[2,2]/(confusion_mtrx[2,2] + confusion_mtrx[1,2])
+    f1 <- (2*precision*recall)/(precision + recall)
+    return(f1)
+  }
+}
+
+
+
+# Adjust quanteda function for binary classification (i.e. change last layer activation to Sigmoid)
+textmodel_mlp_jsk <- function(x, y, units = 512, dropout = .2,
+                                optimizer = "adam",
+                                loss = "binary_crossentropy",
+                                metrics = "accuracy", ...) {
+    stopifnot(ndoc(x) == length(y))
+
+    x <- as.dfm(x)
+    y <- as.factor(y)
+    result <- list(x = x, y = y, call = match.call(), classnames = levels(y))
+
+    # trim missings for fitting model
+    na_ind <- which(is.na(y))
+    if (length(na_ind) > 0) {
+        # message(length(na_ind), "observations with the value 'NA' were removed.")
+        y <- y[-na_ind]
+        x <- x[-na_ind, ]
+    }
+
+    # "one-hot" encode y
+    y2 <- to_categorical(as.integer(y) - 1, num_classes = nlevels(y))
+
+    # use keras to fit the model
+    model <- keras_model_sequential() %>%
+        layer_dense(units = units, input_shape = nfeat(x), activation = "relu") %>%
+        layer_dropout(rate = dropout) %>%
+        layer_dense(units = nlevels(y), activation = "sigmoid")
+    compile(model, loss = loss, optimizer = optimizer, metrics = metrics)
+    history <- fit(model, x, y2, ...)
+
+    # compile, class, and return the result
+    result <- c(result, nfeatures = nfeat(x), list(seqfitted = model))
+    class(result) <- c("textmodel_mlp", "textmodel", "list")
+    return(result)
+}
+
+
+```
+
+# Data Prep
+
+```{r}
+# Read in data
+train <- read.csv("train.csv")
+test <- read.csv("test.csv")
+
+# Misspelled words count
+bad_spelling <- hunspell(train$text)
+bad_spelling_count <- as.matrix(unlist(lapply(bad_spelling, FUN = length)))
+
+# capscount
+caps_count <- train$text %>% 
+  str_extract_all("[[:upper:]]{2,}") %>% 
+  tokens() %>% 
+  ntoken() %>%
+  as.matrix()
+
+# question mark count
+question_mark_count <- train$text %>% 
+  str_extract_all("[?]{2,}") %>% 
+  tokens() %>% 
+  ntoken() %>%
+  as.matrix()
+
+# exclamation mark count
+exclamation_mark_count <- train$text %>% 
+  str_extract_all("[!]{2,}") %>% 
+  tokens() %>% 
+  ntoken() %>%
+  as.matrix()
+
+# Hashtag mark count
+hashtag_count <- train$text %>% 
+  str_extract_all("#") %>% 
+  tokens() %>% 
+  ntoken() %>%
+  as.matrix()
+
+# Counts
+text_summary <- train$text %>% tokens() %>% textstat_summary()
+text_summary_full <- cbind(text_summary, attack = train$attack)
+urls_count <- as.matrix(text_summary_full$urls)
+symbol_count <- as.matrix(text_summary_full$symbols)
+emoji_count <- as.matrix(text_summary_full$emojis)
+
+
+# Train dfm
+train_corpus <- corpus(train, docid_field = "id")
+dfm_train <- train_corpus %>%
+  tokens(remove_url = TRUE, remove_separators = TRUE, remove_punct = TRUE) %>%
+  tokens_remove(c("the", "to", "and", "of", "a", "you", "i", "is", "that", "in", "not", "for", "on")) %>%
+  tokens_wordstem() %>%
+  dfm()
+
+
+
+# Set up sentiment dictionary
+sentiment_dictionary_dfm <- dfm_lookup(dfm(train_corpus), dictionary = data_dictionary_LSD2015[1:2])
+
+# Set up dictionary of first and second person pronouns, indicating biased language
+# Adler, B. T., De Alfaro, L., Mola-Velasco, S. M., Rosso, P., & West, A. G. (2011, February). Wikipedia vandalism detection: Combining natural language, metadata, and reputation features. In International Conference on Intelligent Text Processing and Computational Linguistics (pp. 277-288). Springer, Berlin, Heidelberg.
+pronouns_dict <- quanteda::dictionary(list(pronouns = c("you", "YOU", "You", "I", "i", "me", "my", "myself", "your", "you're")))
+pronouns_dictionary_dfm <- dfm_lookup(dfm(train_corpus), dictionary = pronouns_dict)
+
+
+# Set up superlative dictionary 
+url <- "https://www.easypacelearning.com/all-lessons/grammar/1436-comparative-superlative-adjectives-list-from-a-to-z"
+# Storing the url's HTML code
+html_content <- read_html(url)
+tab <- html_table(html_content, fill = TRUE)
+adjectives <- data.frame(tab)
+superlatives_dict <- quanteda::dictionary(list(superlatives = adjectives$X3[-1]))
+superlatives_dictionary_dfm <- dfm_lookup(dfm(train_corpus), dictionary = superlatives_dict)
+
+# Set up slang dictionary # Source: http://www.peevish.co.uk/slang/index.htm
+the_alphabet <- letters
+extract_slang <- function(letter){
+  url <- paste0("http://www.peevish.co.uk/slang/english-slang/",letter,".htm")
+  html_content <- read_html(url)
+  tab <- html_table(html_content, fill = TRUE)
+  len_tab <- 1:length(tab)
+  letter_slang <- NULL
+  for(i in len_tab){
+    temp <- tab[[i]]$X1
+    letter_slang <- c(letter_slang, temp)
+  }
+  return(letter_slang)
+}
+# prep data
+slang_all <- lapply(the_alphabet,FUN = extract_slang)
+slang_all_vec <- unlist(slang_all)
+slang_all_vec <- str_remove_all(slang_all_vec, pattern = "[^a-zA-Z0-9 -]")
+slang_all_vec <- slang_all_vec[!is.na(slang_all_vec)]
+# Make dict
+slang_dict <- quanteda::dictionary(list(slang_words = slang_all_vec))
+slang_dictionary_dfm <- dfm_lookup(dfm(train_corpus), dictionary = slang_dict)
+
+# Create a dictionary of bad words
+bad_words <- read.table("bad-words.txt") # https://www.cs.cmu.edu/~biglou/resources/bad-words.txt
+bad_words_2 <- read.table("badwords.txt") # https://code.google.com/archive/p/badwordslist/downloads
+bad_words_3 <- read.table("list.txt") # https://github.com/RobertJGabriel/Google-profanity-words/blob/master/list.txt
+bad_words_all <- unique(c(bad_words$V1, bad_words_2$V1, bad_words_3$V1))
+curseword_dict_manual <- quanteda::dictionary(list(bad_word = bad_words$V1))
+curseword_dictionary_dfm <- dfm_lookup(dfm(train_corpus), dictionary = curseword_dict_manual)
+
+# This was found not to add any predictive power
+## Add features back that were lost in trimming
+## Trim dfm
+#trimmed_dfm <- dfm_trim(dfm_train, min_termfreq = 20)
+## Find important features you loose because they are rare
+#trimmed_names <- colnames(trimmed_dfm)
+#all_names <- colnames(dfm_train)
+#lost_names <- setdiff(all_names, trimmed_names)
+#all_relevant_words_from_dicts <- c(adjectives$X3[-1], slang_all_vec, bad_words_all)
+#are_there_any <- intersect(lost_names, all_relevant_words_from_dicts)
+#the_lost_dfm <- dfm_train[,are_there_any]
+
+
+
+```
+
+# Lasso
+
+```{r}
+
+# Trim 
+min_frequency <- 20
+trimmed_dfm <- dfm_trim(dfm_train, min_termfreq = min_frequency)
+train_dfm <- cbind(trimmed_dfm, 
+                   caps_count, 
+                   question_mark_count, 
+                   exclamation_mark_count, 
+                   sentiment_dictionary_dfm, 
+                   curseword_dictionary_dfm, 
+                   pronouns_dictionary_dfm,
+                   superlatives_dictionary_dfm,
+                   slang_dictionary_dfm, 
+                   urls_count, 
+                   hashtag_count, 
+                   symbol_count, 
+                   emoji_count,
+                   bad_spelling_count)
+colnames(train_dfm)[(ncol(train_dfm)-7):ncol(train_dfm)] <- c("caps_count", "question_mark_count", "exclamation_mark_count", "urls_count", "hashtag_count", "symbol_count", "emoji_count", "bad_spelling_count")
+
+
+## Set up model with 5-fold cross-validation
+
+folds <- sample(1:5, nrow(trimmed_dfm), replace = TRUE)
+cv_error <- NULL
+for(i in 1:5){
+  # Train it on all folds except i
+  mod3 <- glmnet(trimmed_dfm[tr,], trimmed_dfm@docvars$attack[tr], family="binomial", type.measure = "class")
+  
+  the_lambda_search <- NULL
+  for(j in 1:100){
+    temp <- sum(predict(mod3, trimmed_dfm[folds == i,], type = "class")[,j] == trimmed_dfm@docvars$attack[folds == i])/length(trimmed_dfm@docvars$attack[folds == i])
+    the_lambda_search <- c(the_lambda_search, temp)
+  }
+  
+  # Predict F1 for holdout
+  cv_holdout_pred <- predict(mod3, trimmed_dfm[folds == i,], type = "class", s = mod3$lambda[which.max(the_lambda_search)])
+  confusion_mtrx <- table(cv_holdout_pred, trimmed_dfm@docvars$attack[folds == i])
+  recall <- compute_recall(confusion_mtrx)
+  precision <- compute_precision(confusion_mtrx)
+  (f1 <- compute_f1(precision, recall))
+  cv_error <- c(cv_error, f1)
+}
+# Compute mean of cv error
+(cv_error <- mean(cv_error))
+
+#####################
+
+# Train the lasso
+tr <- sample(1:nrow(trimmed_dfm), nrow(trimmed_dfm)/2) # indexes for training data
+#registerDoMC(cores=2) # trains all 5 folds in parallel (at once rather than one by one)
+mod3 <- glmnet(trimmed_dfm[tr,], trimmed_dfm@docvars$attack[tr], family="binomial", type.measure = "class")
+# Plot lasso regression
+plot(mod3)
+
+# Assess
+assessment <- assess.glmnet(mod3, newx = trimmed_dfm[-tr, ], newy = trimmed_dfm@docvars$attack[-tr])
+# Figure out the best lambda 
+which.min(assessment$class)
+which.min(assessment$deviance)
+which.max(assessment$auc)
+which.min(assessment$mse)
+which.min(assessment$mae)
+
+# Check F1
+lasso_predictions <- predict(mod3, trimmed_dfm[-tr, ], s = mod3$lambda[which.max(assessment$auc)], type = "class")
+confusion_mtrx <- table(lasso_predictions, trimmed_dfm@docvars$attack[-tr])
+recall <- compute_recall(confusion_mtrx)
+precision <- compute_precision(confusion_mtrx)
+(f1 <- compute_f1(precision, recall))
+
+# Display the most predictive features
+index_best <- which.max(assessment$auc)
+beta <- mod3$beta[, index_best]
+head(sort(beta, decreasing = TRUE), 96)
+tail(sort(beta, decreasing = TRUE), 20)
+
+# Predict for blake
+#pred_lasso <- as.integer(predict(mod3, trimmed_dfm_test, type = "class", s = mod3$lambda[which.max(assessment$auc)]))
+#(for_blake <- data.frame(id = test$id, attack = pred_lasso, row.names = FALSE))
+#write.csv(for_blake, "predictions/Fifth_Try_Lasso.csv")
+
+# Compute matrix containing coefficients and display the top 10 coefficients contributing to positive and negative sentiment
+coef_matrix <- coef(mod3, s = mod3$lambda[which.max(assessment$auc)])
+# Most positive coefficients
+attack_indicators_all <- data.frame(coefficient = head(coef_matrix[order(coef_matrix[,1],decreasing=TRUE),], n = 1000))
+attack_indicators <- head(attack_indicators_all, 96)
+attack_indicators_second <- head(attack_indicators_all, 285)
+# Most negative coefficients
+no_attack_indicators <- data.frame(coefficient = head(coef_matrix[order(coef_matrix[,1],decreasing=FALSE),], n = 100))
+
+# Set up dictionary for feature engineering
+attack_lasso_dict_manual <- quanteda::dictionary(list(attack_indicator = rownames(attack_indicators), attack_indicator_less_strong = rownames(attack_indicators_second)))
+attack_lasso_dictionary_dfm <- dfm_lookup(dfm(train_corpus), dictionary = attack_lasso_dict_manual)
+
+```
+
+# Train Neural Network Quanteda
+
+```{r}
+
+########################## Set up a Quanteda Neural Networks
+# Split train into two
+#split_train_test <- function(train_split = 0.75, dfm = train_dfm){
+#  split <- train_split
+#  train_idx <- sample(1:nrow(train_dfm), nrow(train_dfm)*split)
+#  train_train_dfm <- train_dfm[train_idx,]
+#  train_test_dfm <- train_dfm[-train_idx,]
+#  return(list(train_train_dfm, train_test_dfm))
+#}
+  
+########################## Set up model with 5-fold cross-validation
+#folds <- sample(1:5, nrow(train_train_dfm), replace = TRUE)
+#cv_error <- NULL
+#for(i in 1:5){
+#  # Train it on all folds except i
+#  quanteda_mpl <- textmodel_mlp_jsk(train_train_dfm[folds != i,], train_train_dfm@docvars$attack[folds != i], units = 512, dropout = 0.8, epochs = 8, #verbose = 1, loss = "binary_crossentropy", metrics = "accuracy")
+#  
+#  # Predict F1 for holdout
+#  cv_holdout_pred <- predict(quanteda_mpl, train_train_dfm[folds == i,])
+#  confusion_mtrx <- table(cv_holdout_pred, train_train_dfm@docvars$attack[folds == i])
+#  recall <- compute_recall(confusion_mtrx)
+#  precision <- compute_precision(confusion_mtrx)
+#  (f1 <- compute_f1(precision, recall))
+#  cv_error <- c(cv_error, f1)
+#}
+## Compute mean of cv error
+#(cv_error <- mean(cv_error))
+
+########################## Hyperparameter Grid Search
+# Df to store results in
+#the_dataframe <- data.frame(Min_Termfreq = numeric(1), Dropout = numeric(1), Units = numeric(1), Epochs = numeric(1), Test_Recall = #numeric(1), Test_Precision = numeric(1), Test_f1 = numeric(1))
+#
+#for(trim in c(10, 20, 50)){
+#  for(drop in c(0.6, 0.75, 0.8, 0.9)){
+#    for(unit in c(64, 256, 512)){
+#      for(epo in c(5,8,12,25)){
+#        
+#        # Set up dfm
+#        trim_min_freq <- trim
+#        trimmed_dfm <- dfm_trim(dfm_train, min_termfreq = trim_min_freq)
+#        train_dfm <- cbind(trimmed_dfm, 
+#                   sentiment_dictionary_dfm, 
+#                   attack_lasso_dictionary_dfm[,1], 
+#                   curseword_dictionary_dfm, 
+#                   pronouns_dictionary_dfm, 
+#                   slang_dictionary_dfm,
+#                   caps_count, 
+#                   question_mark_count, 
+#                   exclamation_mark_count,
+#                   urls_count, 
+#                   hashtag_count, 
+#                   symbol_count, 
+#                   emoji_count,
+#                   bad_spelling_count)
+#        
+#        # Split train and test
+#        train_test_split_list <- split_train_test()
+#        train_train_dfm <- train_test_split_list[[1]]
+#        train_test_dfm <- train_test_split_list[[2]]
+#        
+#        # Set up model
+#        quanteda_mpl <- textmodel_mlp_jsk(train_train_dfm, train_train_dfm@docvars$attack, units = unit, dropout = drop, epochs = epo, #verbose = 1, loss = "binary_crossentropy", metrics = "accuracy") 
+#        
+#        # See how it does on holdout set
+#        y_test <- predict(quanteda_mpl, train_test_dfm)
+#        (confusion_mtrx <- table(y_test, train_test_dfm@docvars$attack))
+#        recall <- compute_recall(confusion_mtrx)
+#        precision <- compute_precision(confusion_mtrx)
+#        (f1 <- compute_f1(precision, recall))
+#        print(confusion_mtrx)
+#        print(f1)
+#        
+#        results <- c(trim, drop, unit, epo, recall, precision, f1)
+#        the_dataframe <- rbind(the_dataframe, results)
+#        
+#      }
+#    }
+#  }
+#}
+#
+## Get rid of first row of df and display results
+#the_dataframe <- the_dataframe[-c(1:6),]
+#the_dataframe
+#
+#the_best <- the_dataframe %>%
+#  arrange(desc(Test_f1))
+#write.csv(the_best, "Grid_Hyperparameter_Search.csv")
+
+trim_min_freq <- 10
+trimmed_dfm <- dfm_trim(dfm_train, min_termfreq = trim_min_freq)
+train_dfm <- cbind(trimmed_dfm, 
+                   sentiment_dictionary_dfm, 
+                   attack_lasso_dictionary_dfm[,1], 
+                   curseword_dictionary_dfm, 
+                   pronouns_dictionary_dfm, 
+                   slang_dictionary_dfm,
+                   superlatives_dictionary_dfm,
+                   caps_count, 
+                   question_mark_count, 
+                   exclamation_mark_count,
+                   urls_count, 
+                   hashtag_count, 
+                   symbol_count, 
+                   emoji_count,
+                   bad_spelling_count)
+
+colnames(train_dfm)[(ncol(train_dfm)-7):ncol(train_dfm)] <- c("caps_count", "question_mark_count", "exclamation_mark_count", "urls_count", "hashtag_count", "symbol_count", "emoji_count", "bad_spelling_count")
+
+
+split <- 0.75
+train_idx <- sample(1:nrow(train_dfm), nrow(train_dfm)*split)
+train_train_dfm <- train_dfm[train_idx,]
+train_test_dfm <- train_dfm[-train_idx,]
+
+# 0.9, 20, 50 --> 71.1
+# 0.9, 18, 50 --> 70.7
+# 0.9, 22, 50 --> 70.9
+
+# Set up model
+quanteda_mpl <- textmodel_mlp_jsk(train_train_dfm, train_train_dfm@docvars$attack, units = 512, dropout = 0.9, epochs = 12, verbose = 1, loss = "binary_crossentropy", metrics = "accuracy") 
+
+# See how it does on holdout set
+y_test <- predict(quanteda_mpl, train_test_dfm)
+(confusion_mtrx <- table(y_test, train_test_dfm@docvars$attack))
+recall <- compute_recall(confusion_mtrx)
+precision <- compute_precision(confusion_mtrx)
+(f1 <- compute_f1(precision, recall))
+
+
+```
+
+# Test Neural Network Quanteda
+
+```{r}
+######################################################################################################################################################
+
+# capscount
+caps_count_test <- test$text %>% 
+  str_extract_all("[[:upper:]]{2,}") %>% 
+  tokens() %>% 
+  ntoken() %>%
+  as.matrix()
+
+# Misspelled words count
+bad_spelling_test <- hunspell(test$text)
+bad_spelling_count_test <- as.matrix(unlist(lapply(bad_spelling_test, FUN = length)))
+
+# question mark count
+question_mark_count_test <- test$text %>% 
+  str_extract_all("[?]{2,}") %>% 
+  tokens() %>% 
+  ntoken() %>%
+  as.matrix()
+
+# exclamation mark count
+exclamation_mark_count_test <- test$text %>% 
+  str_extract_all("[!]{2,}") %>% 
+  tokens() %>% 
+  ntoken() %>%
+  as.matrix()
+
+# Hashtag mark count
+hashtag_count_test <- test$text %>% 
+  str_extract_all("#") %>% 
+  tokens() %>% 
+  ntoken() %>%
+  as.matrix()
+
+# URL, Symbol and Emoji count
+text_summary_test <- test$text %>% tokens() %>% textstat_summary()
+urls_count_test <- as.matrix(text_summary_test$urls)
+symbol_count_test <- as.matrix(text_summary_test$symbols)
+emoji_count_test <- as.matrix(text_summary_test$emojis)
+
+# Test
+test_corpus <- corpus(test, docid_field = "id")
+dfm_test <- test_corpus %>%
+  tokens(remove_url = TRUE, remove_separators = TRUE, remove_punct = TRUE) %>%
+  tokens_remove(c("the", "to", "and", "of", "a", "you", "i", "is", "that", "in", "not", "for", "on")) %>%
+  tokens_wordstem() %>%
+  dfm()
+
+# Set up dictionaries
+sentiment_dictionary_dfm_test <- dfm_lookup(dfm(test_corpus), dictionary = data_dictionary_LSD2015[1:2])
+pronouns_dictionary_dfm_test <- dfm_lookup(dfm(test_corpus), dictionary = pronouns_dict)
+attack_lasso_dictionary_dfm_test <- dfm_lookup(dfm(test_corpus), dictionary = attack_lasso_dict_manual)
+curseword_dictionary_dfm_test <- dfm_lookup(dfm(test_corpus), dictionary = curseword_dict_manual)
+slang_dictionary_dfm_test <- dfm_lookup(dfm(test_corpus), dictionary = slang_dict)
+superlatives_dictionary_dfm_test <- dfm_lookup(dfm(test_corpus), dictionary = superlatives_dict)
+#
+#save(caps_count_test, bad_spelling_count_test, question_mark_count_test, exclamation_mark_count_test, hashtag_count_test, #text_summary_test, urls_count_test, symbol_count_test, emoji_count_test, test_corpus, dfm_test, sentiment_dictionary_dfm_test, #pronouns_dictionary_dfm_test, attack_lasso_dictionary_dfm_test, curseword_dictionary_dfm_test, slang_dictionary_dfm_test, file = #"test_data_prep.Rdata")
+#saveRDS(to_save, file = "test_data_prep.rds")
+#load(file = "test_data_prep.Rdata")
+
+# Make the super-dfm
+# Trim dfm
+trimmed_dfm_test <- dfm_trim(dfm_test, min_termfreq = trim_min_freq)
+test_dfm <- cbind(trimmed_dfm_test, 
+                  sentiment_dictionary_dfm_test, 
+                  curseword_dictionary_dfm_test, 
+                  attack_lasso_dictionary_dfm_test[,1], 
+                  superlatives_dictionary_dfm_test,
+                  pronouns_dictionary_dfm_test, 
+                  slang_dictionary_dfm_test, 
+                  caps_count_test, 
+                  question_mark_count_test, 
+                  exclamation_mark_count_test,
+                  urls_count_test, 
+                  hashtag_count_test, 
+                  symbol_count_test, 
+                  emoji_count_test,
+                  bad_spelling_count_test)
+
+colnames(test_dfm)[(ncol(test_dfm)-7):ncol(test_dfm)] <- c("caps_count", "question_mark_count", "exclamation_mark_count", "urls_count", "hashtag_count", "symbol_count", "emoji_count", "bad_spelling_count")
+
+# Create dataframe for Kaggle
+kaggle_y_test <- predict(quanteda_mpl, test_dfm)
+predictions_kaggle <- data.frame(id = test$id, attack = kaggle_y_test)
+write.csv(predictions_kaggle, "predictions/twentysecond_Try_NN_quanteda.csv", row.names = FALSE)
+```
+
+# Neural Network (Self-made)
+
+```{r}
+
+# The architecture of the Neural Network below is strongly borrowed from: https://tensorflow.rstudio.com/tutorials/beginners/basic-ml/tutorial_basic_text_classification/
+
+# Set seed
+set.seed(1)
+
+# Split train into two
+split <- 0.75
+train_idx <- sample(1:nrow(train), nrow(train)*split)
+train.1 <- train[train_idx,]
+train.2 <- train[-train_idx,]
+
+# Convert text to tensors
+num_words <- 10000
+max_length <- 300
+text_vectorization <- layer_text_vectorization(max_tokens = num_words,output_sequence_length = max_length)
+
+# train layer of unique words in df --> assign  integer value for each
+text_vectorization %>% adapt(train.1$text)
+
+# Set up model
+input <- layer_input(shape = c(1), dtype = "string")
+output <- input %>% 
+  text_vectorization() %>% 
+  layer_embedding(input_dim = num_words + 1, output_dim = 16) %>%
+  layer_global_average_pooling_1d() %>%
+  layer_dense(units = 16, activation = "relu") %>%
+  layer_dropout(0.5) %>% 
+  layer_dense(units = 1, activation = "sigmoid")
+model <- keras_model(input, output)
+
+# configure  model with optimizer and loss function
+model %>% compile(optimizer = 'adam', loss = 'binary_crossentropy', metrics = list('accuracy'))
+
+# Train the model
+the_model <- model %>% fit(
+  train.1$text,
+  as.numeric(train.1$attack == 1),
+  epochs = 10,
+  batch_size = 512,
+  validation_split = 0.2,
+  verbose=2)
+
+## Set up model with 5-fold cross-validation
+folds <- sample(1:5, nrow(train.1), replace = TRUE)
+cv_error <- NULL
+for(i in 1:5){
+  
+  # Set up model
+  input <- layer_input(shape = c(1), dtype = "string")
+  output <- input %>% 
+    text_vectorization() %>% 
+    layer_embedding(input_dim = num_words + 1, output_dim = 512) %>%
+    layer_global_average_pooling_1d() %>%
+    layer_dense(units = 16, activation = "relu") %>%
+    layer_dropout(0.5) %>% 
+    layer_dense(units = 1, activation = "sigmoid")
+  model <- keras_model(input, output)
+
+  # configure  model with optimizer and loss function
+  model %>% compile(optimizer = 'adam', loss = 'binary_crossentropy', metrics = list('accuracy'))
+  
+  # Train the model
+  the_model <- model %>% fit(
+  train.1$text[folds != i],
+  as.numeric(train.1$attack == 1)[folds != i],
+  epochs = 15,
+  batch_size = 64,
+  validation_split = 0.2,
+  verbose=2)
+  
+  class(model)
+  # Predict F1 for holdout
+  options(scipen = 999)
+  cv_holdout_pred <- predict(model, train.1$text[folds == i])
+  predictions_y <- ifelse(cv_holdout_pred < 0.5, 0, 1)
+  confusion_mtrx <- table(predictions_y, train.1$attack[folds == i])
+  recall <- compute_recall(confusion_mtrx)
+  precision <- compute_precision(confusion_mtrx)
+  (f1 <- compute_f1(precision, recall))
+  cv_error <- c(cv_error, f1)
+}
+# Compute mean of cv error
+(cv_error <- mean(cv_error))
+
+
+# Find optimal threshold
+optimiser_f1 <- optimise(find_optimal_threshold, interval = 0.01, lower = 0.2, upper = 0.4, maximum = TRUE)
+threshold_to_go <- optimiser_f1$maximum
+
+# See how it does on holdout set
+y_test <- predict(model, train.2$text, verbose = 2)
+y_test_vec <- ifelse(y_test >= threshold_to_go, 1, 0) %>% as.vector()
+(confusion_mtrx <- table(y_test_vec, train.2$attack))
+recall <- compute_recall(confusion_mtrx)
+precision <- compute_precision(confusion_mtrx)
+(f1 <- compute_f1(precision, recall))
+
+
+# Predict on Test Set 
+#y_test <- predict(model, test$text, verbose = 2)
+#y_test_vec <- ifelse(y_test >= threshold_to_go, 1, 0) %>% as.vector()
+#predictions <- data.frame(id = test$id, attack = as.integer(y_test_vec))
+#write.csv(predictions, "predictions/tenth_Try_NN.csv")
+
+
+```
+
+# Naive Bayes Classifier
+
+```{r}
+set.seed(1)
+
+train_dfm <- cbind(trimmed_dfm, 
+                   sentiment_dictionary_dfm, 
+                   attack_lasso_dictionary_dfm[,1], 
+                   curseword_dictionary_dfm, 
+                   pronouns_dictionary_dfm,
+                   superlatives_dictionary_dfm,
+                   slang_dictionary_dfm, 
+                   caps_count, 
+                   question_mark_count, 
+                   exclamation_mark_count,
+                   urls_count, 
+                   hashtag_count, 
+                   symbol_count, 
+                   emoji_count,
+                   bad_spelling_count)
+colnames(train_dfm)[(ncol(train_dfm)-7):ncol(train_dfm)] <- c("caps_count", "question_mark_count", "exclamation_mark_count", "urls_count", "hashtag_count", "symbol_count", "emoji_count", "bad_spelling_count")
+
+# get training and test set
+train_ids <- sample(train$id, floor(length(train$id))*0.75)
+dfmat_training <- dfm_subset(dfm_train, docid_ %in% train_ids)
+dfmat_test <- dfm_subset(dfm_train, !docid_ %in% train_ids)
+
+# Train model
+tmod_nb <- textmodel_nb(dfmat_training, dfmat_training@docvars$attack)
+summary(tmod_nb)
+dfmat_matched <- dfm_match(dfmat_test, features = featnames(dfmat_training))
+
+###############
+
+folds <- sample(1:5, nrow(dfmat_training), replace = TRUE)
+cv_error <- NULL
+for(i in 1:5){
+  # Train it on all folds except i
+  tmod_nb <- textmodel_nb(dfmat_training, dfmat_training@docvars$attack)
+  
+  # Predict F1 for holdout
+  cv_holdout_pred <- predict(tmod_nb, dfmat_training[folds == i,])
+  confusion_mtrx <- table(cv_holdout_pred, dfmat_training@docvars$attack[folds == i])
+  recall <- compute_recall(confusion_mtrx)
+  precision <- compute_precision(confusion_mtrx)
+  (f1 <- compute_f1(precision, recall))
+  cv_error <- c(cv_error, f1)
+}
+# Compute mean of cv error
+(cv_error <- mean(cv_error))
+
+###############
+
+# Check accuracy with test set
+actual_class <- dfmat_matched@docvars$attack
+predicted_class <- predict(tmod_nb, newdata = dfmat_matched)
+confusion_mtrx <- table(actual_class, predicted_class)
+recall <- compute_recall(confusion_mtrx)
+precision <- compute_precision(confusion_mtrx)
+(f1 <- compute_f1(precision, recall))
+
+# Kaggle
+#the_actual_test <- dfm_match(dfm_test, features = featnames(dfmat_training))
+#predicted_class_test <- predict(tmod_nb, newdata = the_actual_test)
+#for_blake <- data.frame(id = test$id, attack = unname(predicted_class_test), row.names = NULL)
+#write.csv(for_blake, "predictions/First_Try_NB.csv")
+```
+
+# SVM
+
+```{r}
+
+# Trim svm
+trimmed_dfm <- dfm_trim(dfm_train, min_termfreq = 20)
+train_dfm <- cbind(trimmed_dfm,
+                   sentiment_dictionary_dfm, 
+                   attack_lasso_dictionary_dfm[,1], 
+                   curseword_dictionary_dfm, 
+                   superlatives_dictionary_dfm,
+                   pronouns_dictionary_dfm, 
+                   slang_dictionary_dfm, 
+                   caps_count,
+                   question_mark_count,
+                   exclamation_mark_count,
+                   urls_count, 
+                   hashtag_count, 
+                   symbol_count, 
+                   emoji_count,
+                   bad_spelling_count)
+colnames(train_dfm)[(ncol(train_dfm)-7):ncol(train_dfm)] <- c("caps_count", "question_mark_count", "exclamation_mark_count", "urls_count", "hashtag_count", "symbol_count", "emoji_count", "bad_spelling_count")
+
+
+############################## Textmodel svm
+
+## Set up simple linear svm and get predictions
+#mod1 <- textmodel_svm(trimmed_dfm, trimmed_dfm@docvars$attack)
+#predictions_svm <- predict(mod1, trimmed_dfm)
+#
+## Compute metrics 
+#svm_confusion <- table(predictions_svm, trimmed_dfm@docvars$attack)
+#svm_precision <- compute_precision(svm_confusion)
+#svm_recall <- compute_recall(svm_confusion)
+#(svm_f1 <- compute_f1(svm_precision, svm_recall))
+
+############################## validated textmodel svm
+
+# Split into training and test data
+train_ids <- sample(train_dfm@docvars$docid_, nrow(train_dfm)*0.75)
+train_train_dfm <- dfm_subset(train_dfm, docid_ %in% train_ids)
+train_holdout_dfm <- dfm_subset(train_dfm, !docid_ %in% train_ids)
+
+# Set up simple linear svm and get predictions for holdout
+mod2 <- textmodel_svm(train_train_dfm, train_train_dfm@docvars$attack)
+predictions_svm <- predict(mod2, train_holdout_dfm)
+
+# Compute metrics 
+(svm_confusion <- table(predictions_svm, train_holdout_dfm@docvars$attack))
+svm_precision <- compute_precision(svm_confusion)
+svm_recall <- compute_recall(svm_confusion)
+(svm_f1 <- compute_f1(svm_precision, svm_recall))
+
+###############
+
+folds <- sample(1:5, nrow(train_train_dfm), replace = TRUE)
+cv_error <- NULL
+for(i in 1:5){
+  # Train it on all folds except i
+  mod2 <- textmodel_svm(train_train_dfm, train_train_dfm@docvars$attack)
+  
+  # Predict F1 for holdout
+  cv_holdout_pred <- predict(mod2, train_train_dfm[folds == i,])
+  confusion_mtrx <- table(cv_holdout_pred, train_train_dfm@docvars$attack[folds == i])
+  recall <- compute_recall(confusion_mtrx)
+  precision <- compute_precision(confusion_mtrx)
+  (f1 <- compute_f1(precision, recall))
+  cv_error <- c(cv_error, f1)
+}
+# Compute mean of cv error
+(cv_error <- mean(cv_error))
+
+###############
+
+########################## Kaggle
+
+## Trim test dfm
+#trimmed_dfm_test <- dfm_trim(dfm_test, min_termfreq = 20)
+#test_dfm <- cbind(trimmed_dfm_test, 
+#                  caps_count_test, 
+#                  question_mark_count_test, 
+#                  exclamation_mark_count_test, 
+#                  sentiment_dictionary_dfm_test, 
+#                  curseword_dictionary_dfm_test, 
+#                  attack_lasso_dictionary_dfm_test[,1], 
+#                  superlatives_dictionary_dfm_test,
+#                  pronouns_dictionary_dfm_test, 
+#                  slang_dictionary_dfm_test, 
+#                  hashtag_count_test, 
+#                  urls_count_test, 
+#                  symbol_count_test, 
+#                  emoji_count_test,
+#                  bad_spelling_count_test)
+#
+## Predict
+#predictions_svm_test <- predict(mod2, test_dfm)
+#(for_blake <- data.frame(id = test$id, attack = unname(predictions_svm_test)))
+#write.csv(for_blake, "predictions/Fourth_Try_SVM.csv", row.names = FALSE)
+
+```
+
